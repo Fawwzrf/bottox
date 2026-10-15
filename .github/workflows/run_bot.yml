@@ -1,0 +1,38 @@
+name: Auto Trading Tournament 24/7
+
+on:
+  workflow_dispatch: # Tombol Start Manual
+  schedule:
+    - cron: '0 */6 * * *' # Otomatis menyambung setiap 6 jam tanpa henti!
+
+permissions:
+  contents: write # Izinkan bot menyimpan file hasil_6varian_48jam.txt ke repository
+
+jobs:
+  run-quant-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: Ambil Kode & Memori Terakhir
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Library
+        run: pip install requests urllib3
+
+      - name: Jalankan Bot Turnamen (5.5 Jam Nonstop)
+        run: python3 -u tournament_6_godmode.py
+
+      - name: Simpan Hasil & Saldo ke Repository Otomatis
+        if: always()
+        run: |
+          git config --global user.name "QuantBot AutoSave"
+          git config --global user.email "bot@users.noreply.github.com"
+          git add hasil_6varian_48jam.txt state_6varian.json
+          git commit -m "Auto-save klasemen & memori dompet" || echo "Tidak ada perubahan"
+          git pull --rebase origin main || true
+          git push
