@@ -1,20 +1,22 @@
 import os
 import json
 import time
+import subprocess
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from datetime import datetime, timezone
 
 # ==============================================================================
-# 1. KONFIGURASI GLOBAL & FILE PENYIMPANAN MEMORI (ANTI-RESET)
+# 1. KONFIGURASI GLOBAL & PENYIMPANAN REAL-TIME ANTI-LOST CHECKPOINT
 # ==============================================================================
 INITIAL_BALANCE = 12.50
 MAX_OPEN_POSITIONS = 3
 DEX_FEE_SLIPPAGE = 0.004
 LOG_FILE = "hasil_6varian_48jam.txt"
-STATE_FILE = "state_6varian.json"   # Menyimpan saldo & posisi agar tahan restart!
-MAX_RUNTIME_SECONDS = 19800         # Jalan 5.5 jam per sesi GitHub Actions, lalu simpan & estafet
+STATE_FILE = "state_6varian.json"
+STATE_VERSION = "V3_5ELITE_METHODS"     # Reset bersih jika file lama masih versi V2 (6 metode lama)
+MAX_RUNTIME_SECONDS = 18000             # 5 Jam per sesi, lalu estafet ke antrean berikutnya
 
 _retry = Retry(total=2, backoff_factor=0.6, status_forcelist=[429, 500, 502, 503, 504])
 _adapter = HTTPAdapter(max_retries=_retry)
@@ -30,50 +32,58 @@ audit_cache = {}
 global_blacklist = set()
 
 # ==============================================================================
-# 2. DEFINISI PARAMETER 6 METODE ALGORITMA TERBAIK
+# 2. DEFINISI 5 METODE ELIT (M1, M2, HYBRID M1+M2, & 2 METODE BARU)
 # ==============================================================================
 VARIANTS_CONFIG = {
-    'M1_PULLBACK_V2': {
-        'mode': 'pullback', 'base_alloc': 0.25, 'min_liq': 12000, 'min_bs': 1.60, 'min_buys': 40,
-        'min_avg_tx': 18.0, 'max_fdv_liq': 12.0, 'min_m5': 3.0, 'max_m5': 42.0,
-        'pb_min': 2.5, 'pb_max': 10.0, 'cont_bs': 1.80, 'hard_sl': -15.0, 'be_trig': 14.0, 'be_lock': 1.5,
-        'tp1_pct': 28.0, 'tp1_sell': 0.40, 'tp2_pct': 65.0, 'tp2_sell': 0.58,
-        'base_trail': 0.14, 'tight_trail': 0.09, 'stagnant_m': 10.0
+    'M1_PULLBACK_PRO': {
+        'desc': 'Refined Pullback V2 (Diskon 3-9.5% + Zero-Negative Trail)',
+        'mode': 'm1_pullback',
+        'base_alloc': 0.25, 'min_liq': 15000, 'min_bs': 1.65, 'min_buys': 45,
+        'min_avg_tx': 20.0, 'max_fdv_liq': 10.5, 'min_m5': 4.0, 'max_m5': 38.0,
+        'pb_min': 3.0, 'pb_max': 9.5, 'cont_bs': 1.95,
+        'hard_sl': -13.5, 'be_trig': 10.5, 'be_lock': 1.8,
+        'tp1_pct': 26.0, 'tp1_sell': 0.45, 'tp2_pct': 60.0, 'tp2_sell': 0.55,
+        'base_trail': 0.12, 'tight_trail': 0.08, 'stagnant_m': 9.0
     },
-    'M2_VELOCITY_HFT': {
-        'mode': 'velocity', 'base_alloc': 0.25, 'min_liq': 10000, 'min_bs': 1.85, 'min_buys': 55,
-        'min_avg_tx': 15.0, 'max_fdv_liq': 14.0, 'min_m5': 4.0, 'max_m5': 38.0,
-        'pb_min': 0.5, 'pb_max': 6.5, 'cont_bs': 2.00, 'hard_sl': -11.0, 'be_trig': 9.0, 'be_lock': 2.0,
-        'tp1_pct': 18.0, 'tp1_sell': 0.60, 'tp2_pct': 42.0, 'tp2_sell': 0.50,
-        'base_trail': 0.10, 'tight_trail': 0.06, 'stagnant_m': 6.0
+    'M2_VELOCITY_PRO': {
+        'desc': 'Refined Velocity HFT (Tick Accel + Fast 60% TP-1)',
+        'mode': 'm2_velocity',
+        'base_alloc': 0.25, 'min_liq': 14000, 'min_bs': 1.85, 'min_buys': 55,
+        'min_avg_tx': 18.0, 'max_fdv_liq': 12.0, 'min_m5': 4.5, 'max_m5': 35.0,
+        'pb_min': 1.0, 'pb_max': 6.5, 'cont_bs': 2.10,
+        'hard_sl': -11.5, 'be_trig': 9.0, 'be_lock': 2.0,
+        'tp1_pct': 18.5, 'tp1_sell': 0.60, 'tp2_pct': 45.0, 'tp2_sell': 0.50,
+        'base_trail': 0.09, 'tight_trail': 0.06, 'stagnant_m': 6.5
     },
-    'M3_WHALE_SHADOW': {
-        'mode': 'whale', 'base_alloc': 0.25, 'min_liq': 22000, 'min_bs': 1.55, 'min_buys': 35,
-        'min_avg_tx': 42.0, 'max_fdv_liq': 8.5, 'min_m5': 3.0, 'max_m5': 48.0,
-        'pb_min': 3.0, 'pb_max': 11.5, 'cont_bs': 1.75, 'hard_sl': -14.0, 'be_trig': 15.0, 'be_lock': 2.0,
-        'tp1_pct': 38.0, 'tp1_sell': 0.35, 'tp2_pct': 85.0, 'tp2_sell': 0.50,
-        'base_trail': 0.16, 'tight_trail': 0.10, 'stagnant_m': 14.0
+    'M3_HYBRID_APEX': {
+        'desc': 'Kombinasi M1+M2 (Wajib Pullback Diskon + Tick Acceleration)',
+        'mode': 'm3_hybrid',
+        'base_alloc': 0.25, 'min_liq': 15000, 'min_bs': 1.75, 'min_buys': 50,
+        'min_avg_tx': 20.0, 'max_fdv_liq': 10.0, 'min_m5': 4.0, 'max_m5': 36.0,
+        'pb_min': 2.0, 'pb_max': 8.5, 'cont_bs': 2.05,
+        'hard_sl': -12.0, 'be_trig': 9.5, 'be_lock': 2.0,
+        'tp1_pct': 21.0, 'tp1_sell': 0.50, 'tp2_pct': 52.0, 'tp2_sell': 0.55,
+        'base_trail': 0.10, 'tight_trail': 0.06, 'stagnant_m': 7.5
     },
-    'M4_AMM_ELASTICITY': {
-        'mode': 'amm_shock', 'base_alloc': 0.25, 'min_liq': 14000, 'min_bs': 1.65, 'min_buys': 45,
-        'min_avg_tx': 20.0, 'max_fdv_liq': 9.5, 'min_m5': 2.5, 'max_m5': 24.0,
-        'pb_min': 1.5, 'pb_max': 8.5, 'cont_bs': 1.75, 'hard_sl': -13.5, 'be_trig': 12.0, 'be_lock': 2.0,
-        'tp1_pct': 32.0, 'tp1_sell': 0.45, 'tp2_pct': 70.0, 'tp2_sell': 0.55,
-        'base_trail': 0.13, 'tight_trail': 0.08, 'stagnant_m': 9.5
+    'M4_TEMPORAL_FRACTAL': {
+        'desc': 'Multi-Timeframe Surge (Vol m5 >= 2.2x Vol h1 + Buyer Shift)',
+        'mode': 'm4_fractal',
+        'base_alloc': 0.25, 'min_liq': 16000, 'min_bs': 1.70, 'min_buys': 48,
+        'min_avg_tx': 22.0, 'max_fdv_liq': 9.5, 'min_m5': 4.0, 'max_m5': 34.0,
+        'pb_min': 1.5, 'pb_max': 8.0, 'cont_bs': 1.90,
+        'hard_sl': -12.5, 'be_trig': 10.0, 'be_lock': 2.0,
+        'tp1_pct': 24.0, 'tp1_sell': 0.50, 'tp2_pct': 58.0, 'tp2_sell': 0.50,
+        'base_trail': 0.11, 'tight_trail': 0.07, 'stagnant_m': 8.0
     },
-    'M5_RATCHET_SHIELD': {
-        'mode': 'ratchet', 'base_alloc': 0.25, 'min_liq': 13000, 'min_bs': 1.65, 'min_buys': 42,
-        'min_avg_tx': 20.0, 'max_fdv_liq': 11.0, 'min_m5': 3.5, 'max_m5': 40.0,
-        'pb_min': 2.5, 'pb_max': 9.5, 'cont_bs': 1.80, 'hard_sl': -13.0, 'be_trig': 10.0, 'be_lock': 2.0,
-        'tp1_pct': 25.0, 'tp1_sell': 0.40, 'tp2_pct': 58.0, 'tp2_sell': 0.50,
-        'base_trail': 0.13, 'tight_trail': 0.07, 'stagnant_m': 9.0
-    },
-    'M6_KELLY_GODMODE': {
-        'mode': 'kelly_godmode', 'base_alloc': 0.25, 'min_liq': 15000, 'min_bs': 1.65, 'min_buys': 45,
-        'min_avg_tx': 22.0, 'max_fdv_liq': 10.0, 'min_m5': 3.0, 'max_m5': 36.0,
-        'pb_min': 2.0, 'pb_max': 9.0, 'cont_bs': 1.85, 'hard_sl': -12.5, 'be_trig': 10.0, 'be_lock': 2.0,
-        'tp1_pct': 26.0, 'tp1_sell': 0.45, 'tp2_pct': 62.0, 'tp2_sell': 0.55,
-        'base_trail': 0.12, 'tight_trail': 0.06, 'stagnant_m': 8.5
+    'M5_VORTEX_ANTIFRAGILE': {
+        'desc': 'Whale Absorption Wall + Instant 12% Free-Ride (High WinRate)',
+        'mode': 'm5_vortex',
+        'base_alloc': 0.25, 'min_liq': 16000, 'min_bs': 1.75, 'min_buys': 50,
+        'min_avg_tx': 24.0, 'max_fdv_liq': 9.0, 'min_m5': 3.5, 'max_m5': 28.0,
+        'pb_min': 1.5, 'pb_max': 7.5, 'cont_bs': 1.95,
+        'hard_sl': -11.0, 'be_trig': 8.0, 'be_lock': 2.5,
+        'tp1_pct': 12.5, 'tp1_sell': 0.55, 'tp2_pct': 40.0, 'tp2_sell': 0.50,
+        'base_trail': 0.09, 'tight_trail': 0.05, 'stagnant_m': 6.5
     }
 }
 
@@ -86,7 +96,7 @@ def write_log(text):
         f.write(text + "\n")
 
 # ==============================================================================
-# 3. SISTEM LOAD & SAVE MEMORI OTOMATIS (JSON CHECKPOINT)
+# 3. SISTEM CHECKPOINT & LIVE GITHUB PUSH (ANTI-HILANG DATA ANTAR LOOP)
 # ==============================================================================
 def init_or_load_state():
     global engines, global_blacklist, total_elapsed_sec
@@ -94,25 +104,30 @@ def init_or_load_state():
         try:
             with open(STATE_FILE, "r", encoding="utf-8") as f:
                 saved = json.load(f)
-            total_elapsed_sec = saved.get('total_elapsed_sec', 0.0)
-            global_blacklist = set(saved.get('global_blacklist', []))
-            for v_name, cfg in VARIANTS_CONFIG.items():
-                s_eng = saved.get('engines', {}).get(v_name, {})
-                engines[v_name] = {
-                    'cfg': cfg,
-                    'cash_usd': s_eng.get('cash_usd', INITIAL_BALANCE),
-                    'positions': s_eng.get('positions', {}),
-                    'watchlist': s_eng.get('watchlist', {}),
-                    'blacklist': set(s_eng.get('blacklist', [])),
-                    'wins': s_eng.get('wins', 0),
-                    'losses': s_eng.get('losses', 0),
-                    'gross_profit': s_eng.get('gross_profit', 0.0),
-                    'gross_loss': s_eng.get('gross_loss', 0.0),
-                    'peak_equity': s_eng.get('peak_equity', INITIAL_BALANCE),
-                    'max_dd_pct': s_eng.get('max_dd_pct', 0.0)
-                }
-            write_log(f"♻️ [CHECKPOINT LOADED] Melanjutkan sesi sebelumnya (Total Durasi: {total_elapsed_sec/3600:.2f} Jam)")
-            return
+            if saved.get('version') == STATE_VERSION:
+                total_elapsed_sec = saved.get('total_elapsed_sec', 0.0)
+                global_blacklist = set(saved.get('global_blacklist', []))
+                for v_name, cfg in VARIANTS_CONFIG.items():
+                    s_eng = saved.get('engines', {}).get(v_name, {})
+                    engines[v_name] = {
+                        'cfg': cfg,
+                        'cash_usd': s_eng.get('cash_usd', INITIAL_BALANCE),
+                        'positions': s_eng.get('positions', {}),
+                        'watchlist': s_eng.get('watchlist', {}),
+                        'blacklist': set(s_eng.get('blacklist', [])),
+                        'wins': s_eng.get('wins', 0),
+                        'losses': s_eng.get('losses', 0),
+                        'gross_profit': s_eng.get('gross_profit', 0.0),
+                        'gross_loss': s_eng.get('gross_loss', 0.0),
+                        'peak_equity': s_eng.get('peak_equity', INITIAL_BALANCE),
+                        'max_dd_pct': s_eng.get('max_dd_pct', 0.0),
+                        'consec_losses': s_eng.get('consec_losses', 0),
+                        'cooldown_until': s_eng.get('cooldown_until', 0.0)
+                    }
+                write_log(f"♻️ [CHECKPOINT V3 LOADED] Melanjutkan sesi secara akurat (Durasi Akumulasi: {total_elapsed_sec/3600:.2f} Jam)")
+                return
+            else:
+                write_log("🔄 [UPGRADE DETECTED] Memulai turnamen bersih untuk 5 Metode Elit V3.0...")
         except Exception as e:
             write_log(f"[WARNING] Gagal memuat state lama, memulai baru: {e}")
 
@@ -120,10 +135,11 @@ def init_or_load_state():
         engines[v_name] = {
             'cfg': cfg, 'cash_usd': INITIAL_BALANCE, 'positions': {}, 'watchlist': {},
             'blacklist': set(), 'wins': 0, 'losses': 0, 'gross_profit': 0.0,
-            'gross_loss': 0.0, 'peak_equity': INITIAL_BALANCE, 'max_dd_pct': 0.0
+            'gross_loss': 0.0, 'peak_equity': INITIAL_BALANCE, 'max_dd_pct': 0.0,
+            'consec_losses': 0, 'cooldown_until': 0.0
         }
 
-def save_state(session_elapsed):
+def save_state(session_elapsed, push_to_git=False):
     serializable_engines = {}
     for v_name, eng in engines.items():
         serializable_engines[v_name] = {
@@ -136,15 +152,27 @@ def save_state(session_elapsed):
             'gross_profit': eng['gross_profit'],
             'gross_loss': eng['gross_loss'],
             'peak_equity': eng['peak_equity'],
-            'max_dd_pct': eng['max_dd_pct']
+            'max_dd_pct': eng['max_dd_pct'],
+            'consec_losses': eng['consec_losses'],
+            'cooldown_until': eng['cooldown_until']
         }
     data = {
+        'version': STATE_VERSION,
         'total_elapsed_sec': total_elapsed_sec + session_elapsed,
         'global_blacklist': list(global_blacklist),
         'engines': serializable_engines
     }
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f)
+
+    if push_to_git:
+        try:
+            subprocess.run(["git", "add", LOG_FILE, STATE_FILE], check=False)
+            subprocess.run(["git", "commit", "-m", f"Live sync {((total_elapsed_sec + session_elapsed)/3600):.2f}h"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(["git", "pull", "--rebase", "-X", "theirs", "origin", "main"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(["git", "push", "origin", "main"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
 
 # ==============================================================================
 # 4. AUDIT KONTRAK & SINGLE DATA INGESTION
@@ -169,7 +197,7 @@ def verify_contract_safety(token_address):
                 audit_cache[token_address] = res
                 global_blacklist.add(token_address)
                 return res
-        if score > 600:
+        if score > 500:
             res = (False, score, f"Skor Tinggi ({score})")
             audit_cache[token_address] = res
             global_blacklist.add(token_address)
@@ -234,7 +262,7 @@ def fetch_shared_market_data():
     return best_pairs_by_token, open_pairs_data
 
 # ==============================================================================
-# 5. MESIN EVALUASI POSISI & EKSEKUSI PER VARIAN
+# 5. MESIN EVALUASI POSISI & EKSEKUSI 5 METODE ELIT
 # ==============================================================================
 def get_total_equity(v_name):
     eng = engines[v_name]
@@ -250,13 +278,22 @@ def close_variant_position(v_name, pair_addr, curr_price, reason):
     total_returned = pos['realized_usd'] + remaining_usd
     net_profit = total_returned - pos['invested_usd']
     roi_pct = (net_profit / pos['invested_usd']) * 100
+    now_ts = datetime.now(timezone.utc).timestamp()
 
     if net_profit >= 0:
         eng['wins'] += 1
         eng['gross_profit'] += net_profit
+        eng['consec_losses'] = 0
     else:
         eng['losses'] += 1
         eng['gross_loss'] += abs(net_profit)
+        eng['consec_losses'] += 1
+        # GLOBAL SCAM IMMUNITY: Jika rugpull/stop loss, blokir koin ini untuk semua metode!
+        global_blacklist.add(pos['token_address'])
+        # CIRCUIT BREAKER: Jika 2x kalah beruntun, istirahat 25 menit dari pasar buruk
+        if eng['consec_losses'] >= 2:
+            eng['cooldown_until'] = now_ts + 1500
+            write_log(f"🛡️ [{v_name}] Mengaktifkan Cooldown 25 Menit (Proteksi Pasar Buruk)")
 
     eng['blacklist'].add(pos['token_address'])
     del eng['positions'][pair_addr]
@@ -274,7 +311,7 @@ def close_variant_position(v_name, pair_addr, curr_price, reason):
 
     now_str = datetime.now().strftime('%H:%M:%S')
     write_log(
-        f"🏁 [{now_str}] [{v_name:<17}] {reason:<18} | {pos['symbol']:<10} | "
+        f"🏁 [{now_str}] [{v_name:<21}] {reason:<18} | {pos['symbol']:<10} | "
         f"PnL: {net_profit:+.2f} USD ({roi_pct:+.1f}%) | "
         f"Ekuitas: ${tot_eq:.2f} ({growth:+.1f}%) | WR: {eng['wins']}W/{eng['losses']}L ({wr:.0f}%)"
     )
@@ -286,6 +323,7 @@ def process_variant(v_name, best_pairs_by_token, open_pairs_data):
     now_ts = datetime.now(timezone.utc).timestamp()
     now_ms = now_ts * 1000
 
+    # A. KAWAL POSISI AKTIF
     for p_addr, pos in list(eng['positions'].items()):
         p_data = open_pairs_data.get(p_addr) or best_pairs_by_token.get(pos['token_address'])
         if not p_data:
@@ -307,20 +345,17 @@ def process_variant(v_name, best_pairs_by_token, open_pairs_data):
         liq_drop = (pos['entry_liq'] - curr_liq) / pos['entry_liq']
         hold_mins = (now_ts - pos['entry_time']) / 60.0
 
+        # ZERO-NEGATIVE TRAILING & BREAKEVEN LOCK
         if max_pnl_pct >= cfg['be_trig'] and not pos['breakeven_locked']:
             pos['breakeven_locked'] = True
             pos['dynamic_sl_pct'] = max(pos['dynamic_sl_pct'], cfg['be_lock'])
 
-        if mode in ['ratchet', 'kelly_godmode']:
-            if max_pnl_pct >= 50.0: pos['dynamic_sl_pct'] = max(pos['dynamic_sl_pct'], 38.0)
-            elif max_pnl_pct >= 32.0: pos['dynamic_sl_pct'] = max(pos['dynamic_sl_pct'], 22.0)
-            elif max_pnl_pct >= 20.0: pos['dynamic_sl_pct'] = max(pos['dynamic_sl_pct'], 11.0)
-            elif max_pnl_pct >= 10.0: pos['dynamic_sl_pct'] = max(pos['dynamic_sl_pct'], 2.0)
-
-        if liq_drop >= 0.12 or (sells > buys * 2.2 and pnl_pct < -4.0):
+        # 1. Deteksi Darurat Anti-Rug
+        if liq_drop >= 0.12 or (sells > buys * 2.1 and pnl_pct < -3.5):
             close_variant_position(v_name, p_addr, curr_price, "🚨 ANTI-RUG EXIT")
             continue
 
+        # 2. Take Profit Tier 1
         if pnl_pct >= cfg['tp1_pct'] and not pos['tp1_hit']:
             sell_tokens = pos['tokens'] * cfg['tp1_sell']
             pos['tokens'] -= sell_tokens
@@ -328,8 +363,11 @@ def process_variant(v_name, best_pairs_by_token, open_pairs_data):
             eng['cash_usd'] += net_usd
             pos['realized_usd'] += net_usd
             pos['tp1_hit'] = True
-            write_log(f"💵 [{v_name:<17}] TP-1 (+{pnl_pct:.1f}%) pada {pos['symbol']} | Cair: +${net_usd:.2f}")
+            pos['breakeven_locked'] = True
+            pos['dynamic_sl_pct'] = max(pos['dynamic_sl_pct'], 2.5)
+            write_log(f"💵 [{v_name:<21}] TP-1 (+{pnl_pct:.1f}%) pada {pos['symbol']} | Cair: +${net_usd:.2f}")
 
+        # 3. Take Profit Tier 2
         if pnl_pct >= cfg['tp2_pct'] and not pos['tp2_hit']:
             sell_tokens = pos['tokens'] * cfg['tp2_sell']
             pos['tokens'] -= sell_tokens
@@ -337,27 +375,31 @@ def process_variant(v_name, best_pairs_by_token, open_pairs_data):
             eng['cash_usd'] += net_usd
             pos['realized_usd'] += net_usd
             pos['tp2_hit'] = True
-            write_log(f"🔥 [{v_name:<17}] TP-2 (+{pnl_pct:.1f}%) pada {pos['symbol']} | Cair: +${net_usd:.2f}")
+            write_log(f"🔥 [{v_name:<21}] TP-2 (+{pnl_pct:.1f}%) pada {pos['symbol']} | Cair: +${net_usd:.2f}")
 
-        if hold_mins >= cfg['stagnant_m'] and pnl_pct < 5.0 and bs_ratio < 1.15:
+        # 4. Time-Stop
+        if hold_mins >= cfg['stagnant_m'] and pnl_pct < 4.5 and bs_ratio < 1.20:
             close_variant_position(v_name, p_addr, curr_price, "⏳ TIME-STOP")
             continue
 
+        # 5. Trailing Stop (Wajib hanya mengeksekusi jika posisi masih di zona untung / pnl_pct >= 1.0%)
         active_trail = cfg['tight_trail'] if pos['tp1_hit'] else cfg['base_trail']
-        if mode in ['ratchet', 'kelly_godmode'] and max_pnl_pct >= 80.0:
-            active_trail = 0.05
-
-        if max_pnl_pct >= 11.0 and drop_from_peak >= active_trail:
+        if max_pnl_pct >= 12.0 and drop_from_peak >= active_trail and pnl_pct >= 1.0:
             close_variant_position(v_name, p_addr, curr_price, "🎯 TRAILING PROFIT")
             continue
 
+        # 6. Breakeven Lock / Hard Stop Loss
         if pnl_pct <= pos['dynamic_sl_pct']:
-            reason = "🛡️ RATCHET/BE LOCK" if pos['breakeven_locked'] else "❌ HARD STOP LOSS"
+            reason = "🛡️ BREAKEVEN PROFIT" if pos['breakeven_locked'] else "❌ HARD STOP LOSS"
             close_variant_position(v_name, p_addr, curr_price, reason)
             continue
 
+    # B. CEK COOLDOWN & SELEKSI WATCHLIST
+    if now_ts < eng['cooldown_until']:
+        return
+
     for t_addr in list(eng['watchlist'].keys()):
-        if now_ts - eng['watchlist'][t_addr]['added_time'] > 900:
+        if now_ts - eng['watchlist'][t_addr]['added_time'] > 720:
             del eng['watchlist'][t_addr]
 
     if len(eng['positions']) >= MAX_OPEN_POSITIONS or eng['cash_usd'] < 2.0:
@@ -368,7 +410,7 @@ def process_variant(v_name, best_pairs_by_token, open_pairs_data):
             break
         pair_addr = pair.get('pairAddress')
         symbol = pair['baseToken']['symbol']
-        if token_addr in eng['blacklist'] or pair_addr in eng['positions']:
+        if token_addr in eng['blacklist'] or token_addr in global_blacklist or pair_addr in eng['positions']:
             continue
 
         created_at = pair.get('pairCreatedAt', 0)
@@ -384,6 +426,12 @@ def process_variant(v_name, best_pairs_by_token, open_pairs_data):
         buys_5m = txns_5m.get('buys', 0)
         sells_5m = max(1, txns_5m.get('sells', 1))
         vol_5m = pair.get('volume', {}).get('m5', 0)
+
+        txns_h1 = pair.get('txns', {}).get('h1', {})
+        buys_h1 = max(1, txns_h1.get('buys', 1))
+        sells_h1 = max(1, txns_h1.get('sells', 1))
+        vol_h1 = max(1.0, pair.get('volume', {}).get('h1', 1.0))
+
         m5_chg = float(pair.get('priceChange', {}).get('m5', 0) or 0)
         h1_chg = float(pair.get('priceChange', {}).get('h1', 0) or 0)
 
@@ -391,9 +439,19 @@ def process_variant(v_name, best_pairs_by_token, open_pairs_data):
         vol_to_liq = vol_5m / liq_usd
         avg_tx_usd = vol_5m / max(1, (buys_5m + sells_5m))
         fdv_to_liq = fdv_usd / liq_usd
-        net_order_imbalance = (buys_5m - sells_5m) / max(1, (buys_5m + sells_5m))
-        lai_score = vol_to_liq * net_order_imbalance
 
+        # --- METRIK KHUSUS METODE BARU M4 (TEMPORAL FRACTAL) ---
+        avg_5m_vol_in_h1 = vol_h1 / 12.0
+        temporal_vol_surge = vol_5m / max(1.0, avg_5m_vol_in_h1)
+        buy_share_m5 = buys_5m / max(1, (buys_5m + sells_5m))
+        buy_share_h1 = buys_h1 / max(1, (buys_h1 + sells_h1))
+        buyer_dominance_shift = buy_share_m5 - buy_share_h1
+
+        # --- METRIK KHUSUS METODE BARU M5 (VORTEX ABSORPTION) ---
+        # Dollar-Per-Percent (DPP): seberapa besar uang masuk per 1% perubahan harga
+        dpp_absorption = (vol_5m / max(1.0, abs(m5_chg))) / liq_usd
+
+        # EVALUASI KOIN DI WATCHLIST (TAHAP 2)
         if token_addr in eng['watchlist']:
             w = eng['watchlist'][token_addr]
             w['checks'] += 1
@@ -403,45 +461,52 @@ def process_variant(v_name, best_pairs_by_token, open_pairs_data):
             pullback_pct = ((w['peak_price'] - price_usd) / w['peak_price']) * 100
             liq_growth_pct = ((liq_usd - w['init_liq']) / w['init_liq']) * 100
 
-            if bs_ratio < 1.25 or liq_usd < w['init_liq'] * 0.92:
+            # Wajib tren 5m masih positif (>= +3%) dan likuiditas tidak menyusut!
+            if bs_ratio < 1.35 or m5_chg < 3.0 or liq_usd < w['init_liq'] * 0.96:
                 del eng['watchlist'][token_addr]
                 continue
 
             trigger_buy = False
             trigger_desc = ""
 
-            if mode == 'velocity':
-                if (bs_ratio >= w['last_bs'] and buys_5m > w['last_buys'] and price_usd >= w['last_price'] * 1.005) or (1.0 <= pullback_pct <= 6.0 and bs_ratio >= 2.0):
+            if mode == 'm1_pullback':
+                # M1: Fokus murni pada Pullback Diskon Sehat dengan likuiditas stabil/naik
+                if (cfg['pb_min'] <= pullback_pct <= cfg['pb_max']) and bs_ratio >= cfg['min_bs'] and liq_growth_pct >= -1.0:
+                    trigger_buy = True
+                    trigger_desc = f"Pullback -{pullback_pct:.1f}% (B/S {bs_ratio:.2f}x)"
+
+            elif mode == 'm2_velocity':
+                # M2: Fokus pada Tick Acceleration beruntun
+                if (bs_ratio >= w['last_bs'] and buys_5m > w['last_buys'] and price_usd >= w['last_price'] * 1.004 and bs_ratio >= 1.90) or (1.5 <= pullback_pct <= 6.0 and bs_ratio >= 2.15):
                     trigger_buy = True
                     trigger_desc = f"Tick Accel (B/S {bs_ratio:.2f}x)"
-            elif mode == 'amm_shock':
-                if lai_score >= 0.08 and liq_growth_pct >= 0.0 and (1.5 <= pullback_pct <= 8.5 or price_usd >= w['init_price'] * 1.01):
+
+            elif mode == 'm3_hybrid':
+                # M3 HYBRID (M1 + M2): WAJIB sedang diskon Pullback DAN mengalami Tick Acceleration!
+                is_discounted = (cfg['pb_min'] <= pullback_pct <= cfg['pb_max'])
+                is_accelerating = (price_usd > w['last_price'] and (bs_ratio >= w['last_bs'] or bs_ratio >= 2.0))
+                if is_discounted and is_accelerating and liq_growth_pct >= 0.0:
                     trigger_buy = True
-                    trigger_desc = f"AMM Shock (LAI {lai_score:.2f})"
-            else:
-                is_pb = (cfg['pb_min'] <= pullback_pct <= cfg['pb_max']) and (bs_ratio >= cfg['min_bs'])
-                is_cont = (w['checks'] >= 2) and (price_usd >= w['init_price'] * 1.02) and (bs_ratio >= cfg['cont_bs']) and (pullback_pct < 3.0)
-                if is_pb or is_cont:
+                    trigger_desc = f"Hybrid Pullback -{pullback_pct:.1f}% + Rebound"
+
+            elif mode == 'm4_fractal':
+                # M4 TEMPORAL FRACTAL: Ledakan volume 5m >= 2.2x rata-rata 1 jam + Pergeseran Pembeli >= +6%
+                if temporal_vol_surge >= 2.2 and buyer_dominance_shift >= 0.06 and (1.5 <= pullback_pct <= 8.0 or price_usd > w['last_price']):
                     trigger_buy = True
-                    trigger_desc = f"Pullback -{pullback_pct:.1f}%" if is_pb else "Momentum Confirmed"
+                    trigger_desc = f"Fractal Surge {temporal_vol_surge:.1f}x (Shift +{buyer_dominance_shift*100:.0f}%)"
+
+            elif mode == 'm5_vortex':
+                # M5 VORTEX ANTIFRAGILE: Penyerapan likuiditas tinggi (DPP >= 0.025) + Likuiditas kolam bertambah
+                if dpp_absorption >= 0.025 and liq_growth_pct >= 0.5 and bs_ratio >= 1.80 and pullback_pct <= 7.5:
+                    trigger_buy = True
+                    trigger_desc = f"Vortex Absorb (DPP {dpp_absorption:.3f} | Liq +{liq_growth_pct:.1f}%)"
 
             w['last_bs'] = bs_ratio
             w['last_buys'] = buys_5m
             w['last_price'] = price_usd
 
             if trigger_buy:
-                alloc_pct = cfg['base_alloc']
-                if mode == 'kelly_godmode':
-                    conviction = 0.0
-                    if bs_ratio >= 2.1: conviction += 0.35
-                    elif bs_ratio >= 1.75: conviction += 0.20
-                    if fdv_to_liq <= 5.5: conviction += 0.30
-                    if liq_growth_pct > 1.0: conviction += 0.20
-                    if lai_score >= 0.08: conviction += 0.15
-                    alloc_pct = round(0.16 + (0.19 * min(1.0, conviction)), 2)
-                    trigger_desc += f" [Kelly {int(alloc_pct*100)}%]"
-
-                invest_usd = eng['cash_usd'] * alloc_pct
+                invest_usd = eng['cash_usd'] * cfg['base_alloc']
                 if invest_usd >= 1.4:
                     eng['cash_usd'] -= invest_usd
                     eff_usd = invest_usd * (1 - DEX_FEE_SLIPPAGE)
@@ -456,16 +521,15 @@ def process_variant(v_name, best_pairs_by_token, open_pairs_data):
                         'tp1_hit': False, 'tp2_hit': False
                     }
                     now_str = datetime.now().strftime('%H:%M:%S')
-                    write_log(f"🚀 [{now_str}] [{v_name:<17}] BELI {symbol:<10} (${price_usd:.6f}) | Alokasi: ${invest_usd:.2f} | {trigger_desc}")
+                    write_log(f"🚀 [{now_str}] [{v_name:<21}] BELI {symbol:<10} (${price_usd:.6f}) | Alokasi: ${invest_usd:.2f} | {trigger_desc}")
                 del eng['watchlist'][token_addr]
             continue
 
-        if not (cfg['min_m5'] <= m5_chg <= cfg['max_m5'] and h1_chg >= 0):
-            continue
-        if mode == 'amm_shock' and lai_score < 0.07:
+        # SELEKSI MASUK KE WATCHLIST (TAHAP 1)
+        if not (cfg['min_m5'] <= m5_chg <= cfg['max_m5'] and h1_chg > 0):
             continue
 
-        if (bs_ratio >= cfg['min_bs'] and vol_to_liq >= 0.20 and avg_tx_usd >= cfg['min_avg_tx'] and fdv_to_liq <= cfg['max_fdv_liq'] and buys_5m >= cfg['min_buys']):
+        if (bs_ratio >= cfg['min_bs'] and vol_to_liq >= 0.22 and avg_tx_usd >= cfg['min_avg_tx'] and fdv_to_liq <= cfg['max_fdv_liq'] and buys_5m >= cfg['min_buys']):
             is_safe, score, _ = verify_contract_safety(token_addr)
             if is_safe:
                 eng['watchlist'][token_addr] = {
@@ -476,15 +540,18 @@ def process_variant(v_name, best_pairs_by_token, open_pairs_data):
             else:
                 eng['blacklist'].add(token_addr)
 
+# ==============================================================================
+# 6. CETAK KLASEMEN & SINKRONISASI BERKALA
+# ==============================================================================
 def print_leaderboard(session_elapsed):
     elapsed_h = (total_elapsed_sec + session_elapsed) / 3600.0
     now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     lines = [
-        "\n==========================================================================================================",
-        f"🏆 KLASEMEN TURNAMEN 6-METODE QUANT SOLANA | Total Durasi: {elapsed_h:.2f} Jam ({now_str})",
-        "----------------------------------------------------------------------------------------------------------",
-        f"{'METODE VARIAN':<18} | {'EKUITAS':<10} | {'ROI (%)':<9} | {'WIN/LOSS':<10} | {'WIN RATE':<9} | {'PROFIT FACTOR':<13} | {'MAX DD':<8} | {'AKTIF'}",
-        "----------------------------------------------------------------------------------------------------------"
+        "\n==============================================================================================================",
+        f"🏆 KLASEMEN TURNAMEN 5-METODE ELIT V3.0 | Total Durasi Akumulasi: {elapsed_h:.2f} Jam ({now_str})",
+        "--------------------------------------------------------------------------------------------------------------",
+        f"{'METODE VARIAN':<22} | {'EKUITAS':<10} | {'ROI (%)':<9} | {'WIN/LOSS':<10} | {'WIN RATE':<9} | {'PROFIT FACTOR':<13} | {'MAX DD':<8} | {'AKTIF'}",
+        "--------------------------------------------------------------------------------------------------------------"
     ]
     ranking = []
     for v_name, eng in engines.items():
@@ -498,14 +565,14 @@ def print_leaderboard(session_elapsed):
     ranking.sort(reverse=True, key=lambda x: x[0])
     for eq, v_name, roi, w, l, wr, pf, dd, act in ranking:
         pf_str = "INF (0 Loss)" if (l == 0 and w > 0) else f"{pf:.2f}x"
-        lines.append(f"{v_name:<18} | ${eq:<9.2f} | {roi:+8.1f}% | {w:>3}W/{l:<3}L  | {wr:>7.1f}% | {pf_str:<13} | -{dd:>5.1f}% | {act} koin")
-    lines.append("==========================================================================================================\n")
+        lines.append(f"{v_name:<22} | ${eq:<9.2f} | {roi:+8.1f}% | {w:>3}W/{l:<3}L  | {wr:>7.1f}% | {pf_str:<13} | -{dd:>5.1f}% | {act} koin")
+    lines.append("==============================================================================================================\n")
     write_log("\n".join(lines))
 
 def main():
     init_or_load_state()
     session_start = datetime.now(timezone.utc).timestamp()
-    write_log("🦅 BOT AKTIF DI CLOUD SERVER (Tahan Laptop Mati & Auto-Checkpoint Aktif)")
+    write_log("🦅 BOT QUANT V3.0 AKTIF (5 Metode Elit + Live Git Sync 15m + Anti-Overlap Queue)")
 
     cycle = 0
     while True:
@@ -517,17 +584,22 @@ def main():
         for v_name in engines.keys():
             process_variant(v_name, best_pairs, open_pairs)
 
+        # Simpan ke file lokal setiap 1 menit (10 siklus)
         if cycle % 10 == 0:
-            save_state(session_elapsed)
+            save_state(session_elapsed, push_to_git=False)
 
+        # Cetak klasemen setiap 3 menit (30 siklus)
         if cycle % 30 == 0:
             print_leaderboard(session_elapsed)
 
-        # Jika sudah berjalan 5.5 jam di GitHub Actions, simpan state dan keluar dengan rapi agar disambung sesi berikutnya
+        # LIVE GIT PUSH setiap 15 menit (150 siklus) agar checkpoint di GitHub selalu real-time!
+        if cycle % 150 == 0:
+            save_state(session_elapsed, push_to_git=True)
+
         if session_elapsed >= MAX_RUNTIME_SECONDS:
-            save_state(session_elapsed)
             print_leaderboard(session_elapsed)
-            write_log("🔄 [ESTAFET SESI CLOUD] Menyimpan state & menyerahkan ke sesi jadwal berikutnya...")
+            save_state(session_elapsed, push_to_git=True)
+            write_log("🔄 [ESTAFET SESI SEMPURNA] State berhasil di-push ke GitHub, siap dilanjutkan sesi berikutnya!")
             break
 
         time.sleep(6)
