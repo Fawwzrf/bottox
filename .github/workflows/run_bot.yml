@@ -1,20 +1,32 @@
 name: Auto Trading Tournament 24/7
 
 on:
-  workflow_dispatch: # Tombol Start Manual
+  workflow_dispatch:
   schedule:
-    - cron: '0 */6 * * *' # Otomatis menyambung setiap 6 jam tanpa henti!
+    - cron: '*/30 * * * *' # Mengecek setiap 30 menit, namun tertahan oleh antrean concurrency jika bot masih jalan
+
+# PENGUNCI ANTREAN: Mencegah 2 sesi berjalan bersamaan!
+concurrency:
+  group: quant-bot-solana-lock
+  cancel-in-progress: false
 
 permissions:
-  contents: write # Izinkan bot menyimpan file hasil_6varian_48jam.txt ke repository
+  contents: write
 
 jobs:
   run-quant-bot:
     runs-on: ubuntu-latest
     timeout-minutes: 350
     steps:
-      - name: Ambil Kode & Memori Terakhir
+      - name: Ambil Kode & Checkpoint Terakhir
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Identitas Git untuk Live Sync
+        run: |
+          git config --global user.name "QuantBot AutoSave"
+          git config --global user.email "bot@users.noreply.github.com"
 
       - name: Setup Python 3.11
         uses: actions/setup-python@v5
@@ -24,15 +36,13 @@ jobs:
       - name: Install Library
         run: pip install requests urllib3
 
-      - name: Jalankan Bot Turnamen (5.5 Jam Nonstop)
+      - name: Jalankan Bot Turnamen (5 Jam Nonstop + Live Sync)
         run: python3 -u tournament_6_godmode.py
 
-      - name: Simpan Hasil & Saldo ke Repository Otomatis
+      - name: Push Checkpoint Akhir Sesi ke Repository
         if: always()
         run: |
-          git config --global user.name "QuantBot AutoSave"
-          git config --global user.email "bot@users.noreply.github.com"
           git add hasil_6varian_48jam.txt state_6varian.json
-          git commit -m "Auto-save klasemen & memori dompet" || echo "Tidak ada perubahan"
-          git pull --rebase origin main || true
-          git push
+          git commit -m "Final session checkpoint save" || echo "Sudah tersimpan"
+          git pull --rebase -X theirs origin main || true
+          git push origin main
